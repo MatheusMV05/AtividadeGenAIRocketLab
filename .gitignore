@@ -1,0 +1,26 @@
+.claude
+/contexto
+
+# Python / FastAPI
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.env
+
+# Node.js / Frontend
+node_modules/
+dist/
+build/
+.next/
+npm-debug.log*
+yarn-error.log*
+.eslintcache
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
