@@ -1,6 +1,9 @@
 import os
-from google import genai
-from google.genai import types
+from dataclasses import dataclass
+
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.providers.google import GoogleProvider
 
 from .database import execute_query, SCHEMA_DESCRIPTION
 from .models import ChatMessage, ChatResponse, QueryData
@@ -25,107 +28,83 @@ Instruções:
 """
 
 
-def _build_contents(messages: list[ChatMessage]) -> list[types.Content]:
-    contents = []
-    for msg in messages:
-        role = "user" if msg.role == "user" else "model"
-        contents.append(
-            types.Content(role=role, parts=[types.Part(text=msg.content)])
-        )
-    return contents
+@dataclass
+class AgentDeps:
+    sql_queries: list[str]
+    last_data: QueryData | None
 
 
-def _make_tool() -> types.Tool:
-    return types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="execute_sql",
-                description="Executa uma consulta SQL SELECT no banco de dados do e-commerce e retorna os resultados.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "query": types.Schema(
-                            type=types.Type.STRING,
-                            description="A consulta SQL SELECT a ser executada. Apenas leitura é permitida.",
-                        )
-                    },
-                    required=["query"],
-                ),
-            )
-        ]
+def _build_agent(api_key: str) -> Agent[AgentDeps, str]:
+    model = GoogleModel(GEMINI_MODEL, provider=GoogleProvider(api_key=api_key))
+    agent: Agent[AgentDeps, str] = Agent(
+        model,
+        system_prompt=SYSTEM_PROMPT,
+        deps_type=AgentDeps,
+        output_type=str,
     )
+
+    @agent.tool
+    async def execute_sql(ctx: RunContext[AgentDeps], query: str) -> dict:
+        """Executa uma consulta SQL SELECT no banco de dados do e-commerce e retorna os resultados."""
+        ctx.deps.sql_queries.append(query)
+        result = execute_query(query)
+        if result["error"]:
+            return {"error": result["error"]}
+        ctx.deps.last_data = QueryData(
+            columns=result["columns"], rows=result["rows"]
+        )
+        return {
+            "columns": result["columns"],
+            "rows": result["rows"],
+            "row_count": len(result["rows"]),
+        }
+
+    return agent
+
+
+def _build_history(messages: list[ChatMessage]):
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        UserPromptPart,
+        TextPart,
+    )
+
+    history = []
+    # All messages except the last one become history; the last user message is the prompt.
+    for msg in messages[:-1]:
+        if msg.role == "user":
+            history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
+        else:
+            history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
+    return history
 
 
 async def run_agent(messages: list[ChatMessage], api_key: str) -> ChatResponse:
-    client = genai.Client(api_key=api_key)
-    tool = _make_tool()
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        tools=[tool],
-        temperature=0.1,
-    )
+    if not messages:
+        return ChatResponse(answer="Nenhuma mensagem fornecida.")
 
-    contents = _build_contents(messages)
-    sql_queries: list[str] = []
-    last_data: QueryData | None = None
+    agent = _build_agent(api_key)
+    deps = AgentDeps(sql_queries=[], last_data=None)
+    history = _build_history(messages)
+    user_prompt = messages[-1].content
 
-    for _ in range(8):  # max agentic iterations
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=config,
+    try:
+        result = await agent.run(
+            user_prompt,
+            deps=deps,
+            message_history=history,
         )
-
-        candidate = response.candidates[0]
-        function_calls = [
-            part.function_call
-            for part in candidate.content.parts
-            if part.function_call
-        ]
-
-        if not function_calls:
-            final_text = "".join(
-                part.text for part in candidate.content.parts if part.text
-            )
-            return ChatResponse(
-                answer=final_text,
-                sql_queries=sql_queries,
-                data=last_data,
-            )
-
-        # Add model turn to history
-        contents.append(candidate.content)
-
-        # Execute each tool call and collect responses
-        tool_response_parts: list[types.Part] = []
-        for fc in function_calls:
-            query: str = fc.args.get("query", "")
-            sql_queries.append(query)
-            result = execute_query(query)
-
-            if result["error"]:
-                response_payload = {"error": result["error"]}
-            else:
-                last_data = QueryData(columns=result["columns"], rows=result["rows"])
-                response_payload = {
-                    "columns": result["columns"],
-                    "rows": result["rows"],
-                    "row_count": len(result["rows"]),
-                }
-
-            tool_response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=fc.name,
-                        response=response_payload,
-                    )
-                )
-            )
-
-        contents.append(types.Content(role="user", parts=tool_response_parts))
-
-    return ChatResponse(
-        answer="Não foi possível completar a análise. Tente reformular sua pergunta.",
-        sql_queries=sql_queries,
-        data=last_data,
-    )
+        return ChatResponse(
+            answer=result.output,
+            sql_queries=deps.sql_queries,
+            data=deps.last_data,
+        )
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        return ChatResponse(
+            answer="Não foi possível completar a análise. Tente reformular sua pergunta.",
+            sql_queries=deps.sql_queries,
+            data=deps.last_data,
+            error=str(exc),
+        )
